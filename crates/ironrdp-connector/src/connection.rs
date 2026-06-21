@@ -703,6 +703,10 @@ fn create_gcc_blocks<'a>(
                         early_capability_flags |= ClientEarlyCapabilityFlags::WANT_32_BPP_SESSION;
                     }
 
+                    if config.support_dynamic_channel_graphics_pipeline {
+                        early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL;
+                    }
+
                     Some(early_capability_flags)
                 },
                 dig_product_id: Some(config.dig_product_id.clone()),
@@ -817,5 +821,124 @@ fn create_client_info_pdu(config: &Config, client_addr: &SocketAddr) -> rdp::Cli
     ClientInfoPdu {
         security_header,
         client_info,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_pdu::gcc::{ClientEarlyCapabilityFlags, KeyboardType};
+    use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
+
+    use super::*;
+    use crate::Credentials;
+
+    #[test]
+    fn gcc_core_data_does_not_advertise_gfx_without_gfx_channel() {
+        let config = Config {
+            desktop_size: DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            desktop_scale_factor: 0,
+            enable_tls: true,
+            enable_credssp: false,
+            credentials: Credentials::UsernamePassword {
+                username: "test".to_owned(),
+                password: "test".to_owned(),
+            },
+            domain: None,
+            client_build: 0,
+            client_name: "test".to_owned(),
+            keyboard_type: KeyboardType::IbmEnhanced,
+            keyboard_subtype: 0,
+            keyboard_layout: 0,
+            keyboard_functional_keys_count: 12,
+            ime_file_name: String::new(),
+            bitmap: None,
+            dig_product_id: String::new(),
+            client_dir: String::new(),
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+            platform: MajorPlatformType::UNIX,
+            hardware_id: None,
+            request_data: None,
+            autologon: false,
+            enable_audio_playback: false,
+            performance_flags: Default::default(),
+            license_cache: None,
+            timezone_info: Default::default(),
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            multitransport_flags: None,
+            support_dynamic_channel_graphics_pipeline: false,
+        };
+
+        let gcc_blocks = create_gcc_blocks(
+            &config,
+            nego::SecurityProtocol::HYBRID,
+            core::iter::empty::<&StaticVirtualChannel>(),
+        )
+        .unwrap();
+        let early_capability_flags = gcc_blocks.core.optional_data.early_capability_flags.unwrap();
+
+        assert!(early_capability_flags.contains(ClientEarlyCapabilityFlags::VALID_CONNECTION_TYPE));
+        assert!(early_capability_flags.contains(ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU));
+        assert!(early_capability_flags.contains(ClientEarlyCapabilityFlags::STRONG_ASYMMETRIC_KEYS));
+        assert!(!early_capability_flags.contains(ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL));
+    }
+
+    #[test]
+    fn gcc_core_data_advertises_gfx_when_enabled() {
+        let mut config = Config {
+            desktop_size: DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            desktop_scale_factor: 0,
+            enable_tls: true,
+            enable_credssp: false,
+            credentials: Credentials::UsernamePassword {
+                username: "test".to_owned(),
+                password: "test".to_owned(),
+            },
+            domain: None,
+            client_build: 0,
+            client_name: "test".to_owned(),
+            keyboard_type: KeyboardType::IbmEnhanced,
+            keyboard_subtype: 0,
+            keyboard_layout: 0,
+            keyboard_functional_keys_count: 12,
+            ime_file_name: String::new(),
+            bitmap: None,
+            dig_product_id: String::new(),
+            client_dir: String::new(),
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+            platform: MajorPlatformType::UNIX,
+            hardware_id: None,
+            request_data: None,
+            autologon: false,
+            enable_audio_playback: false,
+            performance_flags: Default::default(),
+            license_cache: None,
+            timezone_info: Default::default(),
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            multitransport_flags: None,
+            support_dynamic_channel_graphics_pipeline: false,
+        };
+        config.support_dynamic_channel_graphics_pipeline = true;
+
+        let gcc_blocks = create_gcc_blocks(
+            &config,
+            nego::SecurityProtocol::HYBRID,
+            core::iter::empty::<&StaticVirtualChannel>(),
+        )
+        .unwrap();
+        let early_capability_flags = gcc_blocks.core.optional_data.early_capability_flags.unwrap();
+
+        assert!(early_capability_flags.contains(ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL));
     }
 }

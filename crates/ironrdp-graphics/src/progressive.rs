@@ -1076,25 +1076,22 @@ impl ProgressiveDecoder {
 
         let blocks = decode_progressive_stream(bitmap_data)?;
 
-        // Extract context flags from the CONTEXT block. Per MS-RDPEGFX 2.2.4.2
-        // a Progressive stream MUST begin with SYNC + CONTEXT; treat absence as
-        // a malformed stream rather than silently defaulting band layout.
-        let use_reduce_extrapolate = blocks
-            .iter()
-            .find_map(|block| match block {
-                ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
-                _ => None,
-            })
-            .ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?;
+        let context_use_reduce_extrapolate = blocks.iter().find_map(|block| match block {
+            ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
+            _ => None,
+        });
 
         // Get or create the context for this codec_context_id
         let context = match self.contexts.entry(codec_context_id) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
+                let use_reduce_extrapolate =
+                    context_use_reduce_extrapolate.ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?;
                 let surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
                 e.insert(ProgressiveContext { surface })
             }
         };
+        let use_reduce_extrapolate = context_use_reduce_extrapolate.unwrap_or(context.surface.use_reduce_extrapolate);
 
         // If surface dimensions changed, reallocate
         let expected_wide = surface_width.div_ceil(64);
@@ -1635,6 +1632,87 @@ mod tests {
 
         decoder.reset();
         assert!(decoder.contexts.is_empty());
+    }
+
+    #[test]
+    fn decoder_reuses_existing_context_when_stream_omits_context_block() {
+        let mut decoder = ProgressiveDecoder::new();
+
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, encode_progressive_stream,
+        };
+
+        let region = ProgressiveRegion {
+            tile_size: 0x40,
+            rects: vec![RfxRectangle {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            }],
+            quant_vals: vec![],
+            quant_prog_vals: vec![],
+            flags: 0,
+            tiles: vec![],
+        };
+
+        let initial_blocks = vec![
+            ProgressiveBlock::Sync(ProgressiveSyncPdu),
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 0x0040,
+                flags: 0,
+            }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(region.clone()),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ];
+        let encoded = encode_progressive_stream(&initial_blocks).unwrap();
+        decoder.decode_bitmap(1, 640, 480, &encoded).unwrap();
+
+        let update_blocks = vec![
+            ProgressiveBlock::Sync(ProgressiveSyncPdu),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 1,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(region),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ];
+        let encoded = encode_progressive_stream(&update_blocks).unwrap();
+
+        assert!(decoder.decode_bitmap(1, 640, 480, &encoded).is_ok());
+    }
+
+    #[test]
+    fn decoder_rejects_missing_context_for_new_codec_context() {
+        let mut decoder = ProgressiveDecoder::new();
+
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu, ProgressiveSyncPdu,
+            encode_progressive_stream,
+        };
+
+        let blocks = vec![
+            ProgressiveBlock::Sync(ProgressiveSyncPdu),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 0,
+            }),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ];
+        let encoded = encode_progressive_stream(&blocks).unwrap();
+
+        match decoder.decode_bitmap(1, 640, 480, &encoded) {
+            Err(ProgressiveDecodeError::MissingBlock("CONTEXT")) => {}
+            Err(other) => panic!("expected MissingBlock(CONTEXT), got Err({other})"),
+            Ok(_) => panic!("expected MissingBlock(CONTEXT), got Ok"),
+        }
     }
 
     #[test]

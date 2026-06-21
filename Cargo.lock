@@ -2506,6 +2506,7 @@ dependencies = [
  "ironrdp-core",
  "ironrdp-dvc-com-plugin",
  "ironrdp-dvc-pipe-proxy",
+ "ironrdp-egfx",
  "ironrdp-mstsgu",
  "ironrdp-rdcleanpath",
  "ironrdp-rdpsnd-native",

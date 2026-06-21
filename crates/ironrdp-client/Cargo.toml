@@ -47,6 +47,7 @@ ironrdp-mstsgu = { path = "../ironrdp-mstsgu" }
 ironrdp-tokio = { path = "../ironrdp-tokio", version = "0.9", features = ["reqwest"] }
 ironrdp-rdcleanpath.path = "../ironrdp-rdcleanpath"
 ironrdp-dvc-pipe-proxy.path = "../ironrdp-dvc-pipe-proxy"
+ironrdp-egfx = { path = "../ironrdp-egfx", version = "0.2" }
 
 # Logging
 tracing = { version = "0.1", features = ["log"] }

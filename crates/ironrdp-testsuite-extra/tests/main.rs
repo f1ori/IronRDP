@@ -392,6 +392,7 @@ fn default_client_config() -> connector::Config {
         enable_server_pointer: true,
         pointer_software_rendering: true,
         multitransport_flags: None,
+        support_dynamic_channel_graphics_pipeline: false,
         performance_flags: Default::default(),
         timezone_info: Default::default(),
         alternate_shell: String::new(),

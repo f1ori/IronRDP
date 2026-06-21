@@ -258,6 +258,13 @@ pub struct Config {
     /// [\[MS-RDPBCGR\] 2.2.1.3.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/861f2bbb-6ca2-4c5a-8c44-0714fa901e70
     /// [`MultiTransportChannelData`]: ironrdp_pdu::gcc::MultiTransportChannelData
     pub multitransport_flags: Option<gcc::MultiTransportFlags>,
+
+    /// Whether to advertise Graphics Pipeline dynamic virtual channel support.
+    ///
+    /// Set this only when the client also registers an `rdpgfx` dynamic virtual
+    /// channel processor. Servers such as GNOME Remote Desktop require this bit
+    /// before opening the Graphics Pipeline channel.
+    pub support_dynamic_channel_graphics_pipeline: bool,
 }
 
 ironrdp_core::assert_impl!(Config: Send, Sync);

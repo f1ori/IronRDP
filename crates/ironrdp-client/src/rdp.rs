@@ -1,4 +1,5 @@
-use core::num::NonZeroU16;
+use core::num::{NonZeroU16, NonZeroUsize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ironrdp::cliprdr::backend::{ClipboardMessage, CliprdrBackendFactory};
@@ -11,6 +12,7 @@ use ironrdp::dvc::DvcProcessor as _;
 use ironrdp::echo::client::EchoClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::graphics::pointer::DecodedPointer;
+use ironrdp::graphics::progressive::{DecodedTile, ProgressiveDecoder};
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::{PduResult, pdu_other_err};
 use ironrdp::session::image::DecodedImage;
@@ -21,6 +23,11 @@ use ironrdp_core::WriteBuf;
 #[cfg(windows)]
 use ironrdp_dvc_com_plugin::load_dvc_plugin;
 use ironrdp_dvc_pipe_proxy::DvcNamedPipeProxy;
+use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler, Surface};
+use ironrdp_egfx::pdu::{
+    CacheToSurfacePdu, DeleteEncodingContextPdu, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu,
+    WireToSurface2Pdu,
+};
 use ironrdp_rdpsnd_native::cpal;
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use ironrdp_tokio::{FramedWrite, single_sequence_step_read, split_tokio_framed};
@@ -112,6 +119,371 @@ pub struct RdpClient {
     pub dvc_pipe_proxy_factory: DvcPipeProxyFactory,
 }
 
+struct GraphicsSurface {
+    width: u16,
+    height: u16,
+    origin_x: u32,
+    origin_y: u32,
+    is_mapped: bool,
+    data: Vec<u8>,
+}
+
+struct GraphicsCacheEntry {
+    width: u16,
+    height: u16,
+    data: Vec<u8>,
+}
+
+struct ViewerGraphicsPipelineHandler {
+    output_event_sender: mpsc::Sender<RdpOutputEvent>,
+    desktop_width: u32,
+    desktop_height: u32,
+    surfaces: BTreeMap<u16, GraphicsSurface>,
+    cache: BTreeMap<u16, GraphicsCacheEntry>,
+    progressive_decoder: ProgressiveDecoder,
+}
+
+impl ViewerGraphicsPipelineHandler {
+    fn new(output_event_sender: mpsc::Sender<RdpOutputEvent>) -> Self {
+        Self {
+            output_event_sender,
+            desktop_width: 0,
+            desktop_height: 0,
+            surfaces: BTreeMap::new(),
+            cache: BTreeMap::new(),
+            progressive_decoder: ProgressiveDecoder::new(),
+        }
+    }
+
+    fn emit_frame(&self) {
+        let (Some(width), Some(height)) = (
+            u16::try_from(self.desktop_width).ok().and_then(NonZeroU16::new),
+            u16::try_from(self.desktop_height).ok().and_then(NonZeroU16::new),
+        ) else {
+            warn!(
+                width = self.desktop_width,
+                height = self.desktop_height,
+                "Skipping EGFX frame with invalid desktop dimensions"
+            );
+            return;
+        };
+
+        let width_usize = usize::from(NonZeroUsize::from(width));
+        let height_usize = usize::from(NonZeroUsize::from(height));
+        let mut buffer = vec![0; width_usize.saturating_mul(height_usize)];
+
+        for surface in self.surfaces.values().filter(|surface| surface.is_mapped) {
+            let surface_width = usize::from(surface.width);
+            let surface_height = usize::from(surface.height);
+            let origin_x = usize::try_from(surface.origin_x).unwrap_or(usize::MAX);
+            let origin_y = usize::try_from(surface.origin_y).unwrap_or(usize::MAX);
+
+            for y in 0..surface_height {
+                let Some(dst_y) = origin_y.checked_add(y) else {
+                    break;
+                };
+                if dst_y >= height_usize {
+                    break;
+                }
+
+                for x in 0..surface_width {
+                    let Some(dst_x) = origin_x.checked_add(x) else {
+                        break;
+                    };
+                    if dst_x >= width_usize {
+                        break;
+                    }
+
+                    let src_idx = (y * surface_width + x) * 4;
+                    let Some(pixel) = surface.data.get(src_idx..src_idx + 4) else {
+                        break;
+                    };
+
+                    let dst_idx = dst_y * width_usize + dst_x;
+                    buffer[dst_idx] = u32::from_be_bytes([0, pixel[0], pixel[1], pixel[2]]);
+                }
+            }
+        }
+
+        if let Err(e) = self
+            .output_event_sender
+            .try_send(RdpOutputEvent::Image { buffer, width, height })
+        {
+            warn!(error = %e, "Failed to send EGFX frame to viewer");
+        }
+    }
+
+    fn blit_rgba(surface: &mut GraphicsSurface, left: usize, top: usize, width: usize, height: usize, data: &[u8]) {
+        let surface_width = usize::from(surface.width);
+        let surface_height = usize::from(surface.height);
+
+        for y in 0..height {
+            let Some(dst_y) = top.checked_add(y) else {
+                break;
+            };
+            if dst_y >= surface_height {
+                break;
+            }
+
+            for x in 0..width {
+                let Some(dst_x) = left.checked_add(x) else {
+                    break;
+                };
+                if dst_x >= surface_width {
+                    break;
+                }
+
+                let src_idx = (y * width + x) * 4;
+                let dst_idx = (dst_y * surface_width + dst_x) * 4;
+                let (Some(src), Some(dst)) = (
+                    data.get(src_idx..src_idx + 4),
+                    surface.data.get_mut(dst_idx..dst_idx + 4),
+                ) else {
+                    break;
+                };
+                dst.copy_from_slice(src);
+            }
+        }
+    }
+
+    fn copy_surface_rect(
+        source_data: &[u8],
+        source_width: u16,
+        source_height: u16,
+        rect: &ironrdp::pdu::geometry::ExclusiveRectangle,
+    ) -> Option<GraphicsCacheEntry> {
+        if rect.left > rect.right || rect.top > rect.bottom {
+            return None;
+        }
+
+        let source_width_usize = usize::from(source_width);
+        let source_height_usize = usize::from(source_height);
+        let left = usize::from(rect.left);
+        let top = usize::from(rect.top);
+        let right = usize::from(rect.right).min(source_width_usize);
+        let bottom = usize::from(rect.bottom).min(source_height_usize);
+
+        if left >= right || top >= bottom {
+            return None;
+        }
+
+        let width = right - left;
+        let height = bottom - top;
+        let mut data = vec![0; width.saturating_mul(height).saturating_mul(4)];
+
+        for y in 0..height {
+            let src_start = ((top + y) * source_width_usize + left) * 4;
+            let src_end = src_start + width * 4;
+            let dst_start = y * width * 4;
+            let dst_end = dst_start + width * 4;
+            let (Some(src), Some(dst)) = (source_data.get(src_start..src_end), data.get_mut(dst_start..dst_end)) else {
+                return None;
+            };
+            dst.copy_from_slice(src);
+        }
+
+        let width = u16::try_from(width).ok()?;
+        let height = u16::try_from(height).ok()?;
+        Some(GraphicsCacheEntry { width, height, data })
+    }
+
+    fn blit_progressive_tile(surface: &mut GraphicsSurface, tile: &DecodedTile) {
+        const TILE_SIZE: usize = 64;
+
+        let left = usize::from(tile.x_idx) * TILE_SIZE;
+        let top = usize::from(tile.y_idx) * TILE_SIZE;
+        let width = TILE_SIZE.min(usize::from(surface.width).saturating_sub(left));
+        let height = TILE_SIZE.min(usize::from(surface.height).saturating_sub(top));
+
+        Self::blit_rgba(surface, left, top, width, height, &tile.pixels);
+    }
+}
+
+impl GraphicsPipelineHandler for ViewerGraphicsPipelineHandler {
+    fn on_reset_graphics(&mut self, width: u32, height: u32) {
+        self.desktop_width = width;
+        self.desktop_height = height;
+        self.surfaces.clear();
+        self.cache.clear();
+        self.progressive_decoder.reset();
+    }
+
+    fn on_surface_created(&mut self, surface: &Surface) {
+        let len = usize::from(surface.width)
+            .saturating_mul(usize::from(surface.height))
+            .saturating_mul(4);
+        self.surfaces.insert(
+            surface.id,
+            GraphicsSurface {
+                width: surface.width,
+                height: surface.height,
+                origin_x: 0,
+                origin_y: 0,
+                is_mapped: false,
+                data: vec![0; len],
+            },
+        );
+    }
+
+    fn on_surface_deleted(&mut self, surface_id: u16) {
+        if self.surfaces.remove(&surface_id).is_some() {
+            self.emit_frame();
+        }
+    }
+
+    fn on_surface_mapped(&mut self, surface_id: u16, origin_x: u32, origin_y: u32) {
+        if let Some(surface) = self.surfaces.get_mut(&surface_id) {
+            surface.origin_x = origin_x;
+            surface.origin_y = origin_y;
+            surface.is_mapped = true;
+            self.emit_frame();
+        }
+    }
+
+    fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
+        {
+            let Some(surface) = self.surfaces.get_mut(&update.surface_id) else {
+                return;
+            };
+
+            let update_width = usize::from(update.width);
+            let update_height = usize::from(update.height);
+            let left = usize::from(update.destination_rectangle.left);
+            let top = usize::from(update.destination_rectangle.top);
+
+            Self::blit_rgba(surface, left, top, update_width, update_height, &update.data);
+        }
+        self.emit_frame();
+    }
+
+    fn on_frame_complete(&mut self, _frame_id: u32) {
+        self.emit_frame();
+    }
+
+    fn on_solid_fill(&mut self, pdu: &SolidFillPdu) {
+        {
+            let Some(surface) = self.surfaces.get_mut(&pdu.surface_id) else {
+                return;
+            };
+
+            let pixel = [pdu.fill_pixel.r, pdu.fill_pixel.g, pdu.fill_pixel.b, 0xff];
+            let surface_width = usize::from(surface.width);
+            let surface_height = usize::from(surface.height);
+
+            for rect in &pdu.rectangles {
+                let left = usize::from(rect.left).min(surface_width);
+                let top = usize::from(rect.top).min(surface_height);
+                let right = usize::from(rect.right).min(surface_width);
+                let bottom = usize::from(rect.bottom).min(surface_height);
+
+                for y in top..bottom {
+                    for x in left..right {
+                        let idx = (y * surface_width + x) * 4;
+                        let Some(dst) = surface.data.get_mut(idx..idx + 4) else {
+                            break;
+                        };
+                        dst.copy_from_slice(&pixel);
+                    }
+                }
+            }
+        }
+        self.emit_frame();
+    }
+
+    fn on_surface_to_surface(&mut self, pdu: &SurfaceToSurfacePdu) {
+        let Some(source) = self.surfaces.get(&pdu.source_surface_id) else {
+            return;
+        };
+        let Some(cache_entry) =
+            Self::copy_surface_rect(&source.data, source.width, source.height, &pdu.source_rectangle)
+        else {
+            return;
+        };
+
+        {
+            let Some(destination) = self.surfaces.get_mut(&pdu.destination_surface_id) else {
+                return;
+            };
+
+            for point in &pdu.destination_points {
+                Self::blit_rgba(
+                    destination,
+                    usize::from(point.x),
+                    usize::from(point.y),
+                    usize::from(cache_entry.width),
+                    usize::from(cache_entry.height),
+                    &cache_entry.data,
+                );
+            }
+        }
+        self.emit_frame();
+    }
+
+    fn on_surface_to_cache(&mut self, pdu: &SurfaceToCachePdu) {
+        let Some(surface) = self.surfaces.get(&pdu.surface_id) else {
+            return;
+        };
+        if let Some(cache_entry) =
+            Self::copy_surface_rect(&surface.data, surface.width, surface.height, &pdu.source_rectangle)
+        {
+            self.cache.insert(pdu.cache_slot, cache_entry);
+        }
+    }
+
+    fn on_cache_to_surface(&mut self, pdu: &CacheToSurfacePdu) {
+        let Some(cache_entry) = self.cache.get(&pdu.cache_slot) else {
+            return;
+        };
+        {
+            let Some(surface) = self.surfaces.get_mut(&pdu.surface_id) else {
+                return;
+            };
+
+            for point in &pdu.destination_points {
+                Self::blit_rgba(
+                    surface,
+                    usize::from(point.x),
+                    usize::from(point.y),
+                    usize::from(cache_entry.width),
+                    usize::from(cache_entry.height),
+                    &cache_entry.data,
+                );
+            }
+        }
+        self.emit_frame();
+    }
+
+    fn on_wire_to_surface2(&mut self, pdu: &WireToSurface2Pdu) {
+        {
+            let Some(surface) = self.surfaces.get_mut(&pdu.surface_id) else {
+                return;
+            };
+
+            let tiles = match self.progressive_decoder.decode_bitmap(
+                pdu.codec_context_id,
+                surface.width,
+                surface.height,
+                &pdu.bitmap_data,
+            ) {
+                Ok(tiles) => tiles,
+                Err(e) => {
+                    warn!(error = %e, "Failed to decode EGFX progressive bitmap");
+                    return;
+                }
+            };
+
+            for tile in &tiles {
+                Self::blit_progressive_tile(surface, tile);
+            }
+        }
+        self.emit_frame();
+    }
+
+    fn on_delete_encoding_context(&mut self, pdu: &DeleteEncodingContextPdu) {
+        self.progressive_decoder.delete_context(pdu.codec_context_id);
+    }
+}
+
 impl RdpClient {
     pub async fn run(mut self) {
         loop {
@@ -121,6 +493,7 @@ impl RdpClient {
                     rdcleanpath,
                     self.cliprdr_factory.as_deref(),
                     &self.dvc_pipe_proxy_factory,
+                    self.output_event_sender.clone(),
                 )
                 .await
                 {
@@ -138,6 +511,7 @@ impl RdpClient {
                     &self.config,
                     self.cliprdr_factory.as_deref(),
                     &self.dvc_pipe_proxy_factory,
+                    self.output_event_sender.clone(),
                 )
                 .await
                 {
@@ -195,6 +569,7 @@ async fn connect(
     config: &Config,
     cliprdr_factory: Option<&(dyn CliprdrBackendFactory + Send)>,
     dvc_pipe_proxy_factory: &DvcPipeProxyFactory,
+    output_event_sender: mpsc::Sender<RdpOutputEvent>,
 ) -> ConnectorResult<(ConnectionResult, UpgradedFramed)> {
     let dest = config.destination.to_string();
 
@@ -216,6 +591,10 @@ async fn connect(
 
     let mut drdynvc = ironrdp::dvc::DrdynvcClient::new()
         .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())))
+        .with_dynamic_channel(GraphicsPipelineClient::new(
+            Box::new(ViewerGraphicsPipelineHandler::new(output_event_sender.clone())),
+            None,
+        ))
         .with_dynamic_channel(EchoClient::new());
 
     // Instantiate all DVC proxies
@@ -258,7 +637,10 @@ async fn connect(
         }
     }
 
-    let mut connector = connector::ClientConnector::new(config.connector.clone(), client_addr)
+    let mut connector_config = config.connector.clone();
+    connector_config.support_dynamic_channel_graphics_pipeline = true;
+
+    let mut connector = connector::ClientConnector::new(connector_config, client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(rdpsnd::client::Rdpsnd::new(Box::new(cpal::RdpsndBackend::new())))
         .with_static_channel(rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(0));
@@ -310,6 +692,7 @@ async fn connect_ws(
     rdcleanpath: &RDCleanPathConfig,
     cliprdr_factory: Option<&(dyn CliprdrBackendFactory + Send)>,
     dvc_pipe_proxy_factory: &DvcPipeProxyFactory,
+    output_event_sender: mpsc::Sender<RdpOutputEvent>,
 ) -> ConnectorResult<(ConnectionResult, UpgradedFramed)> {
     let hostname = rdcleanpath
         .url
@@ -340,6 +723,10 @@ async fn connect_ws(
 
     let mut drdynvc = ironrdp::dvc::DrdynvcClient::new()
         .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())))
+        .with_dynamic_channel(GraphicsPipelineClient::new(
+            Box::new(ViewerGraphicsPipelineHandler::new(output_event_sender.clone())),
+            None,
+        ))
         .with_dynamic_channel(EchoClient::new());
 
     // Instantiate all DVC proxies
@@ -382,7 +769,10 @@ async fn connect_ws(
         }
     }
 
-    let mut connector = connector::ClientConnector::new(config.connector.clone(), client_addr)
+    let mut connector_config = config.connector.clone();
+    connector_config.support_dynamic_channel_graphics_pipeline = true;
+
+    let mut connector = connector::ClientConnector::new(connector_config, client_addr)
         .with_static_channel(drdynvc)
         .with_static_channel(rdpsnd::client::Rdpsnd::new(Box::new(cpal::RdpsndBackend::new())))
         .with_static_channel(rdpdr::Rdpdr::new(Box::new(NoopRdpdrBackend {}), "IronRDP".to_owned()).with_smartcard(0));
